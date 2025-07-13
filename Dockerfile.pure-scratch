@@ -1,0 +1,98 @@
+# Pure Scratch Runtime Dockerfile - Zero Runtime Vulnerabilities
+# Uses latest secure Alpine for build only, pure scratch for runtime
+
+# Build stage with latest security updates
+FROM alpine:3.21 as secure-builder
+
+# Update package database and install build tools
+RUN apk update && apk upgrade && apk add --no-cache \
+    curl \
+    build-base \
+    openssl-dev \
+    openssl-libs-static \
+    postgresql-dev \
+    pkgconfig \
+    musl-dev \
+    linux-headers \
+    ca-certificates
+
+# Install Rust using latest installer
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.83.0
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --no-modify-path --default-toolchain ${RUST_VERSION} && \
+    rustup target add x86_64-unknown-linux-musl
+
+# Set up for completely static compilation
+ENV CC_x86_64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    OPENSSL_STATIC=true \
+    OPENSSL_DIR=/usr \
+    RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+
+# Create app directory
+WORKDIR /app
+
+# Copy dependency files
+COPY Cargo.toml Cargo.lock ./
+
+# Pre-build dependencies
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release --target x86_64-unknown-linux-musl && \
+    rm -rf src target/x86_64-unknown-linux-musl/release/deps/shopify_oauth_rust*
+
+# Copy source
+COPY src ./src
+COPY migrations ./migrations
+
+# Build application
+RUN cargo build --release --target x86_64-unknown-linux-musl
+
+# Strip binary for minimal size
+RUN strip /app/target/x86_64-unknown-linux-musl/release/shopify-oauth-rust
+
+# Verify it's completely static
+RUN ldd /app/target/x86_64-unknown-linux-musl/release/shopify-oauth-rust 2>&1 | grep -q "not a dynamic executable" || (echo "ERROR: Binary is not static" && exit 1)
+
+# Runtime preparation stage
+FROM scratch as runtime-prep
+
+# Copy only essential files
+COPY --from=secure-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=secure-builder /etc/passwd /etc/passwd
+
+# Final runtime stage - pure scratch (zero attack surface)
+FROM scratch
+
+# Copy CA certificates
+COPY --from=runtime-prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Create minimal passwd
+USER 65534
+
+# Copy the completely static binary
+COPY --from=secure-builder /app/target/x86_64-unknown-linux-musl/release/shopify-oauth-rust /app
+
+# Copy migrations
+COPY --from=secure-builder /app/migrations /migrations
+
+# Set environment
+ENV RUST_LOG=info
+ENV ENVIRONMENT=production
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
+
+# Expose port
+EXPOSE 3000
+
+# Simple health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/app"]
+
+# Run application
+ENTRYPOINT ["/app"]
